@@ -180,9 +180,10 @@ misses.
 
 Verified against live MediaWiki: all five bad matches rejected, all eight good
 ones preserved, with *Comet NEOWISE*, *Halo (optical phenomenon)*, and *Saturn*
-now matched correctly. A further sweep of 20 unrelated real APOD dates through
-the running service gave 17 good or defensible matches, 1 recorded miss, and 1
-lexically perfect but semantically wrong match — both remaining limits are
+now matched correctly. A further 20 unrelated real APOD dates were swept through
+the running service; one failed at the NASA fetch and so never reached
+Wikipedia, leaving 19 matches to judge: 17 good or defensible, 1 recorded miss,
+and 1 lexically perfect but semantically wrong. Both remaining limits are
 documented in the README's Post-Challenge Notes.
 
 ---

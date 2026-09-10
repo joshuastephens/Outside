@@ -322,9 +322,11 @@ advances past a weak tier:
 | Ice Halos over Bavaria | *Rainbow* | *Halo (optical phenomenon)* ✓ |
 | Saturn at Night | *Night Warriors…* | *Saturn* ✓ |
 
-A separate sweep of 20 unrelated real APOD dates through the running service
-produced 17 good or defensible matches, 1 recorded miss, and 1 lexically perfect
-but semantically wrong match (see Post-Challenge Notes).
+A separate sweep of 20 unrelated real APOD dates was also run through the
+running service. One of those dates failed at the NASA fetch and so never
+reached Wikipedia, leaving 19 matches to judge: 17 good or defensible, 1
+recorded miss, and 1 lexically perfect but semantically wrong (see
+Post-Challenge Notes).
 
 **Failures are contained.** `WikipediaProvider.fetch()` never raises; the service
 layer wraps it in a second guard anyway. If Wikipedia is unreachable or finds
