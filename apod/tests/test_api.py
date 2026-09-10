@@ -7,6 +7,7 @@ reaching the real NASA or Wikipedia APIs.
 
 import contextlib
 import datetime
+import logging
 from unittest import mock
 
 from apod.clients import NasaAPODUnavailable, NasaClientError
@@ -228,10 +229,12 @@ class DateRangeTests(NoNetworkTestCase):
 
     def test_nasa_transport_failure_returns_502(self):
         with stub_nasa(side_effect=NasaClientError("connection reset")):
-            response = self.get_apod(SAMPLE_DATE.isoformat())
+            with self.assertLogs("apod.services", level="ERROR") as captured:
+                response = self.get_apod(SAMPLE_DATE.isoformat())
 
         self.assertEqual(response.status_code, 502)
         self.assertIn("connection reset", response.json()["detail"])
+        self.assertIn("NASA fetch failed", captured.records[0].getMessage())
 
 
 class SupplementalFailureTests(NoNetworkTestCase):
@@ -257,7 +260,11 @@ class SupplementalFailureTests(NoNetworkTestCase):
     def test_provider_raising_unexpectedly_still_returns_nasa_data(self):
         with stub_nasa(payload=image_payload()):
             with stub_provider(side_effect=RuntimeError("provider exploded")):
-                response = self.get_apod(SAMPLE_DATE.isoformat())
+                # `assertLogs` captures the stack trace this provokes instead of
+                # letting it print. The trace is the point of the test, not a
+                # symptom of a broken run.
+                with self.assertLogs("apod.services", level="ERROR") as captured:
+                    response = self.get_apod(SAMPLE_DATE.isoformat())
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["title"], "Messier 101")
@@ -265,6 +272,15 @@ class SupplementalFailureTests(NoNetworkTestCase):
         info = SupplementalInfo.objects.get(apod__date=SAMPLE_DATE)
         self.assertEqual(info.status, SupplementalInfo.Status.ERROR)
         self.assertIn("provider exploded", info.reason)
+
+        # Degrading quietly is the correct response to a broken provider, but
+        # only if an operator can still find out it happened -- so the log line,
+        # and the traceback attached to it, are part of the contract.
+        record = captured.records[0]
+        self.assertEqual(record.levelno, logging.ERROR)
+        self.assertIn("Supplemental provider raised", record.getMessage())
+        self.assertIsNotNone(record.exc_info, "the traceback must be recorded")
+        self.assertIs(record.exc_info[0], RuntimeError)
 
     def test_no_wikipedia_match_is_recorded_as_not_found(self):
         miss = SupplementalResult.not_found("wikipedia", "No Wikipedia search results.")

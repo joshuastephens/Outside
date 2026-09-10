@@ -65,3 +65,70 @@ WIKIPEDIA_EXTRACT_RESPONSE = {
 }
 
 WIKIPEDIA_EMPTY_SEARCH_RESPONSE = {"batchcomplete": "", "query": {"search": []}}
+
+
+def search_response(*titles):
+    """Build a MediaWiki `list=search` response for the given page titles."""
+    return {
+        "batchcomplete": "",
+        "query": {
+            "search": [
+                {"ns": 0, "title": title, "pageid": 1000 + index, "snippet": "..."}
+                for index, title in enumerate(titles)
+            ]
+        },
+    }
+
+
+def extract_response(title, extract, pageid=12345, fullurl=None):
+    """Build a MediaWiki `prop=extracts` response for one page."""
+    slug = title.replace(" ", "_")
+    return {
+        "batchcomplete": "",
+        "query": {
+            "pages": {
+                str(pageid): {
+                    "pageid": pageid,
+                    "ns": 0,
+                    "title": title,
+                    "fullurl": fullurl or f"https://en.wikipedia.org/wiki/{slug}",
+                    "extract": extract,
+                }
+            }
+        },
+    }
+
+
+# The five real APOD titles that the unscored cascade matched confidently and
+# wrongly, with the candidates live MediaWiki actually returns for each.
+BAD_MATCH_CANDIDATES = {
+    "Pink Aurora over Crater Lake": [
+        "Mono Lake",
+        "Atmosphere of Mars",
+        "List of natural history museums in the United States",
+        "Mars",
+        "Earth",
+    ],
+    "Comet NEOWISE over Lebanon": ["Yara Zgheib"],
+    "Colorful Clouds Over Sicily": [
+        "Equestrian Portrait of Joachim Murat, King of Naples",
+        "J. Paul Getty Museum",
+        "Zouave",
+        "Agate",
+        "List of Super Wings episodes",
+    ],
+    "Ice Halos over Bavaria": [
+        "Rainbow",
+        "Deaths in September 2023",
+        "Standard German",
+        "White",
+        "List of country-name etymologies",
+    ],
+    "Saturn at Night": [
+        "Saturn",
+        "Perry Saturn",
+        "Night Warriors: Darkstalkers' Revenge",
+        "Night Striker",
+        "Saturn V",
+    ],
+}

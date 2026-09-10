@@ -135,7 +135,7 @@ docker compose up -d db
 docker compose run --rm --entrypoint python web manage.py test
 ```
 
-42 tests, all external HTTP mocked. `NoNetworkTestCase` patches
+68 tests, all external HTTP mocked. `NoNetworkTestCase` patches
 `requests.Session.request` to raise, so a test that forgets to mock something
 fails loudly rather than quietly hitting the real NASA or Wikipedia APIs.
 
@@ -146,7 +146,21 @@ Coverage:
 | Cache hit / miss, date defaulting, validation, graceful degradation | `apod/tests/test_api.py` |
 | Response shape | `apod/tests/test_serializers.py` |
 | Every NASA response shape → its mapped exception | `apod/tests/test_clients.py` |
-| Wikipedia search cascade and every way it comes up empty | `apod/tests/test_providers.py` |
+| Search cascade, candidate scoring, and every way a lookup comes up empty | `apod/tests/test_providers.py` |
+| Tokenizing, scoring, and threshold behaviour in isolation | `apod/tests/test_matching.py` |
+
+The scoring tests use the candidate lists live MediaWiki actually returns for
+real APOD titles, so they pin the exact behaviour described above rather than
+invented examples.
+
+**The run is silent by design.** Several tests deliberately drive failure paths
+— a provider that raises, a NASA timeout, a malformed date — and the production
+code logs each one, correctly and with a full traceback. `QuietLogsMixin` in
+`apod/tests/base.py` captures those records for the duration of a test instead
+of printing them, so a passing run does not look like a broken one. Nothing is
+discarded: the tests that provoke a failure assert with `assertLogs` that it was
+logged, at the right level, with the traceback attached. The project's logging
+configuration is untouched and behaves normally in production.
 
 ---
 
@@ -176,6 +190,7 @@ apod/
   models.py       APOD, SupplementalInfo
   clients.py      NasaAPODClient  -- all NASA HTTP
   providers.py    SupplementalProvider interface + WikipediaProvider
+  matching.py     candidate scoring -- pure functions, no Django
   services.py     get_apod_for_date() -- the DB-first flow
   serializers.py  response shape
   views.py        one APIView
@@ -204,19 +219,23 @@ service layer changing.
 **External calls behind client classes.** No `requests` call appears in a view.
 This keeps transport concerns in one place and gives tests a single seam to mock.
 
-### The Wikipedia search cascade
+### Finding the right Wikipedia page
 
 APOD titles are editorial rather than literal, so a direct page lookup on the
-title misses. Searching is the right tool — but MediaWiki ANDs every search
-term, and that alone still returns **zero hits** for a title like "Witness XZ
-Andromedae Wink". Verified against the live API:
+title misses. Searching is the right tool — but it has two distinct failure
+modes, and they need different fixes.
+
+#### Problem 1: no hits at all
+
+MediaWiki ANDs every search term, so a full editorial title matches nothing.
+Verified against the live API:
 
 ```
 "Witness XZ Andromedae Wink"     -> 0 hits
 "IC 1795: The Fishhead Nebula"   -> 0 hits
 ```
 
-So the search runs as a cascade, stopping at the first query that returns a hit:
+So the search runs as a **cascade** of progressively looser queries:
 
 1. **The title verbatim** — correct when it names its subject outright
    ("The Cat's Eye Nebula from Hubble" → *Cat's Eye Nebula*)
@@ -225,10 +244,87 @@ So the search runs as a cascade, stopping at the first query that returns a hit:
 3. **The terms OR-ed together** — lets relevance ranking find the subject inside
    the prose ("Witness XZ Andromedae Wink" → *XZ Andromedae*)
 
-The top hit's intro extract is then fetched with
-`prop=extracts&exintro&explaintext`. Steps 2 and 3 run only when the previous one
-came up empty, and only on a cache miss, so the common case is still two round
-trips.
+#### Problem 2: plausible wrong hits
+
+The cascade solves "no hits" — and thereby exposes the worse failure. MediaWiki
+returns *something* for almost any query, so tier 1 nearly always fires, and
+whatever relevance ranking hands back gets accepted unconditionally. Across a
+sample of 16 real APOD titles, a match was returned every single time and five
+were confidently wrong:
+
+| APOD title | Accepted page |
+| --- | --- |
+| Pink Aurora over Crater Lake | *Mono Lake* |
+| Comet NEOWISE over Lebanon | *Yara Zgheib* (a novelist) |
+| Colorful Clouds Over Sicily | *Equestrian Portrait of Joachim Murat* |
+| Ice Halos over Bavaria | *Rainbow* (a different phenomenon) |
+| Saturn at Night | *Night Warriors: Darkstalkers' Revenge* |
+
+Titles naming an astronomical object worked well; titles about places, weather,
+and optical phenomena failed, because common words like "Night" and "Lake"
+dominate the ranking. A wrong extract presented as fact is worse than no
+extract, so the fix is to stop trusting the top hit.
+
+#### Scoring
+
+Each tier now requests **five** candidates and scores them (`apod/matching.py`):
+
+- Both the candidate title and the APOD context — its title plus the first 500
+  characters of its explanation — are lowercased, split into words, and stripped
+  of stopwords (`the`, `a`, `an`, `of`, `over`, `from`, `at`, `in`, `on`, `and`,
+  `to`).
+- Each word of the **candidate** scores `1.0` if it appears in the APOD title,
+  or `0.5` if it appears only in the explanation.
+- The total is divided by the number of words in the candidate title.
+
+Normalizing by candidate length is what does the rejecting: *Night Warriors:
+Darkstalkers' Revenge* matches one of its four words against "Saturn at Night",
+so it scores **0.25**. *Mono Lake* matches one of two against "Pink Aurora over
+Crater Lake" — **0.50**. Meanwhile *XZ Andromedae* and *Cat's Eye Nebula* both
+score **1.00**. The threshold sits at **0.60**, inside that gap.
+
+Three details earn their keep:
+
+- **Explanation matches are weighted at 0.5** — below the threshold by
+  construction, so a word mentioned in passing can never carry a match on its
+  own. An explanation of ice halos mentions rainbows; that is precisely how
+  *Rainbow* was being accepted.
+- **Parenthetical qualifiers are stripped.** *Halo (optical phenomenon)* is
+  scored as "Halo", the subject it actually names.
+- **Substring matching bridges compound words** (4+ characters). APOD writes
+  "Fishhead"; Wikipedia titles the page *Fish Head Nebula*.
+
+A tier is accepted only if its best candidate clears the threshold; otherwise
+the cascade advances. That combination is what rescues "Comet NEOWISE over
+Lebanon" — tier 1 offers only the novelist at 0.00, so tier 3 runs and finds
+*Comet NEOWISE* at 1.00. When nothing anywhere clears the bar, the result is a
+recorded `not_found` naming the closest candidate and its score:
+
+```json
+{
+  "source": "wikipedia",
+  "status": "not_found",
+  "reason": "No Wikipedia result scored above 0.60 for 'Pink Aurora over Crater Lake'; best candidate was 'Mono Lake' at 0.50."
+}
+```
+
+#### Verified against the live API
+
+All five bad matches are rejected and all eight good ones preserved. Three of
+the five turn into *correct* matches rather than misses, because the cascade now
+advances past a weak tier:
+
+| APOD title | Was | Now |
+| --- | --- | --- |
+| Pink Aurora over Crater Lake | *Mono Lake* | `not_found` (best 0.50) |
+| Colorful Clouds Over Sicily | *Equestrian Portrait…* | `not_found` (best 0.33) |
+| Comet NEOWISE over Lebanon | *Yara Zgheib* | *Comet NEOWISE* ✓ |
+| Ice Halos over Bavaria | *Rainbow* | *Halo (optical phenomenon)* ✓ |
+| Saturn at Night | *Night Warriors…* | *Saturn* ✓ |
+
+A separate sweep of 20 unrelated real APOD dates through the running service
+produced 17 good or defensible matches, 1 recorded miss, and 1 lexically perfect
+but semantically wrong match (see Post-Challenge Notes).
 
 **Failures are contained.** `WikipediaProvider.fetch()` never raises; the service
 layer wraps it in a second guard anyway. If Wikipedia is unreachable or finds
@@ -247,10 +343,13 @@ normally. Supplemental data is a bonus, never a dependency.
 - **Requesting a date is enough reason to cache it forever.** APOD entries are
   effectively immutable once published, so there is no expiry. A stored row is
   never re-fetched. See Post-Challenge Notes for what would change this.
-- **The top Wikipedia search hit is the right one.** No disambiguation or
-  confidence scoring; the extract is presented as "here is what Wikipedia says
-  about the likely subject", with `matched_title` and `url` included so a
-  consumer can judge the match themselves.
+- **A recorded miss beats a confident wrong answer.** Wikipedia candidates are
+  scored and rejected below a threshold rather than accepted on rank, so
+  `status: "not_found"` with a reason is a normal, healthy outcome — not a
+  malfunction. Scoring is lexical, not semantic, so it rejects unrelated pages
+  but cannot catch a page whose title genuinely matches the APOD's wording.
+  `matched_title` and `url` are always returned so a consumer can judge the
+  match themselves.
 - **`copyright` and `hdurl` are optional.** NASA omits them on many days. Both
   are nullable columns and serialize as `null`, never as empty strings.
 - **No authentication, no rate limiting.** Out of scope for a single public
@@ -286,13 +385,23 @@ something lighter) would return the NASA data immediately and let supplemental
 data appear on the next request. The `SupplementalInfo` table is already modeled
 to make this a small change — the rows simply arrive later.
 
-**Better Wikipedia matching.** The cascade is a good heuristic but not a
-semantic one. Options, in increasing order of effort: check the extract for
-overlap with the APOD explanation before accepting a hit; use
-`list=search&srqiprofile=` tuning; or replace the whole provider with an
-LLM-backed one that reads the explanation and identifies the subject directly.
-The provider interface exists precisely so that swap is a one-line change in
-`get_default_provider()`.
+**Semantic Wikipedia matching.** Candidate scoring (above) fixed the confident
+wrong answers, but it is lexical, and two limits show up in a live sweep:
+
+- *Date-bearing page titles are under-scored.* "A Total Solar Eclipse over
+  Wyoming" is correctly served by *Solar eclipse of August 21, 2017*, but that
+  page scores 0.40 — the day and year in its title match nothing — so it is
+  recorded as a miss. Feeding the APOD's own date into the scoring context would
+  fix this precisely, and would also distinguish that page from *Solar eclipse
+  of April 8, 2024*, which lexical scoring alone cannot.
+- *A perfect lexical match can still be the wrong subject.* "A Road to the
+  Stars" matched the 1957 Soviet film of that name at 1.00. No amount of token
+  overlap catches this; it needs meaning.
+
+The next step for both is an LLM-backed provider that reads the explanation and
+identifies the subject directly. The `SupplementalProvider` interface exists
+precisely so that swap is a one-line change in `get_default_provider()`, and the
+scoring threshold gives a ready-made way to A/B the two.
 
 **The optional frontend.** A server-rendered page at `/` with a
 `<form method="get">` date picker, rendering `<img>`, `<video>`, or `<iframe>`

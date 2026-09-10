@@ -7,9 +7,12 @@ from apod.providers import WikipediaProvider
 
 from .base import SAMPLE_DATE, NoNetworkTestCase
 from .fixtures import (
+    BAD_MATCH_CANDIDATES,
     WIKIPEDIA_EMPTY_SEARCH_RESPONSE,
     WIKIPEDIA_EXTRACT_RESPONSE,
     WIKIPEDIA_SEARCH_RESPONSE,
+    extract_response,
+    search_response,
 )
 
 
@@ -100,13 +103,16 @@ class WikipediaProviderTests(NoNetworkTestCase):
         provider, session = self.provider(
             responses=[
                 FakeResponse(WIKIPEDIA_EMPTY_SEARCH_RESPONSE),
-                FakeResponse(WIKIPEDIA_SEARCH_RESPONSE),
-                FakeResponse(WIKIPEDIA_EXTRACT_RESPONSE),
+                FakeResponse(search_response("Fish Head Nebula", "Heart and Soul Nebula")),
+                FakeResponse(
+                    extract_response("Fish Head Nebula", "The Fish Head Nebula is...")
+                ),
             ]
         )
         result = provider.fetch(self.apod)
 
         self.assertEqual(result.status, SupplementalInfo.Status.FOUND)
+        self.assertEqual(result.matched_title, "Fish Head Nebula")
         self.assertEqual(session.calls[1]["srsearch"], "IC 1795")
 
     def test_candidate_queries_are_ordered_and_deduplicated(self):
@@ -162,16 +168,20 @@ class WikipediaProviderTests(NoNetworkTestCase):
 
     def test_network_failure_is_an_error_result_not_an_exception(self):
         provider, _ = self.provider(exception=requests.Timeout("timed out"))
-        result = provider.fetch(self.apod)
+        with self.assertLogs("apod.providers", level="WARNING") as captured:
+            result = provider.fetch(self.apod)
 
         self.assertEqual(result.status, SupplementalInfo.Status.ERROR)
         self.assertIn("timed out", result.reason)
+        self.assertIn("Wikipedia lookup failed", captured.records[0].getMessage())
 
     def test_http_error_is_an_error_result(self):
         provider, _ = self.provider(responses=[FakeResponse({}, status_code=500)])
-        result = provider.fetch(self.apod)
+        with self.assertLogs("apod.providers", level="WARNING") as captured:
+            result = provider.fetch(self.apod)
 
         self.assertEqual(result.status, SupplementalInfo.Status.ERROR)
+        self.assertIn("Wikipedia lookup failed", captured.records[0].getMessage())
 
     def test_apod_without_a_title_is_not_found(self):
         self.apod.title = ""
@@ -180,3 +190,147 @@ class WikipediaProviderTests(NoNetworkTestCase):
 
         self.assertEqual(result.status, SupplementalInfo.Status.NOT_FOUND)
         self.assertEqual(session.calls, [])
+
+
+class CandidateScoringTests(NoNetworkTestCase):
+    """Scoring, not MediaWiki's ranking, decides which candidate is accepted.
+
+    Each case here is a real APOD title paired with the candidates live
+    MediaWiki actually returns for it.
+    """
+
+    def make_apod(self, title, explanation="", date=SAMPLE_DATE):
+        return APOD.objects.create(
+            date=date,
+            title=title,
+            explanation=explanation,
+            media_type="image",
+            url="https://apod.nasa.gov/apod/image/x.jpg",
+            raw_response={},
+        )
+
+    def provider(self, **kwargs):
+        session = ScriptedSession(**kwargs)
+        return WikipediaProvider(session=session), session
+
+    def test_requests_enough_candidates_to_choose_between(self):
+        apod = self.make_apod("Saturn at Night")
+        provider, session = self.provider(
+            responses=[
+                FakeResponse(search_response("Saturn")),
+                FakeResponse(extract_response("Saturn", "Saturn is the sixth planet.")),
+            ]
+        )
+        provider.fetch(apod)
+
+        self.assertEqual(session.calls[0]["srlimit"], 5)
+
+    def test_rejects_every_candidate_when_none_scores_well_enough(self):
+        """The unscored cascade confidently returned *Mono Lake* here."""
+        apod = self.make_apod(
+            "Pink Aurora over Crater Lake",
+            "A rare pink aurora glows above Crater Lake in Oregon.",
+        )
+        candidates = BAD_MATCH_CANDIDATES["Pink Aurora over Crater Lake"]
+        provider, session = self.provider(
+            responses=[
+                FakeResponse(search_response(*candidates)),
+                FakeResponse(search_response(*candidates)),
+            ]
+        )
+        result = provider.fetch(apod)
+
+        self.assertEqual(result.status, SupplementalInfo.Status.NOT_FOUND)
+        self.assertIsNone(result.matched_title)
+        self.assertIsNone(result.url)
+        self.assertEqual(result.extract, "")
+        # The miss names the closest candidate and its score, so it is diagnosable.
+        self.assertIn("Mono Lake", result.reason)
+        self.assertIn("0.50", result.reason)
+        # No extract was ever requested.
+        self.assertTrue(all("titles" not in call for call in session.calls))
+
+    def test_picks_the_best_scoring_candidate_not_the_first(self):
+        """*Saturn* is third in MediaWiki's ranking and still the right answer."""
+        apod = self.make_apod(
+            "Saturn at Night", "Cassini looks back at the night side of Saturn."
+        )
+        provider, session = self.provider(
+            responses=[
+                FakeResponse(
+                    search_response(
+                        "Perry Saturn",
+                        "Night Warriors: Darkstalkers' Revenge",
+                        "Saturn",
+                        "Night Striker",
+                        "Saturn V",
+                    )
+                ),
+                FakeResponse(
+                    extract_response("Saturn", "Saturn is the sixth planet from the Sun.")
+                ),
+            ]
+        )
+        result = provider.fetch(apod)
+
+        self.assertEqual(result.status, SupplementalInfo.Status.FOUND)
+        self.assertEqual(result.matched_title, "Saturn")
+        self.assertEqual(session.calls[1]["titles"], "Saturn")
+
+    def test_preserves_a_match_that_already_worked(self):
+        """Scoring must not cost us the matches the cascade already got right."""
+        apod = self.make_apod(
+            "Witness XZ Andromedae Wink", "XZ Andromedae is an eclipsing binary."
+        )
+        provider, _session = self.provider(
+            responses=[
+                FakeResponse(search_response("XZ Andromedae", "Nu Andromedae")),
+                FakeResponse(WIKIPEDIA_EXTRACT_RESPONSE),
+            ]
+        )
+        result = provider.fetch(apod)
+
+        self.assertEqual(result.status, SupplementalInfo.Status.FOUND)
+        self.assertEqual(result.matched_title, "XZ Andromedae")
+        self.assertIn("eclipsing binary", result.extract)
+
+    def test_cascade_advances_when_a_tier_scores_too_low(self):
+        """Tier 1 returns a novelist; the OR tier finds the actual comet."""
+        apod = self.make_apod(
+            "Comet NEOWISE over Lebanon", "Comet NEOWISE hangs above the cedars."
+        )
+        provider, session = self.provider(
+            responses=[
+                FakeResponse(search_response("Yara Zgheib")),
+                FakeResponse(search_response("Comet NEOWISE", "C/2016 U1 (NEOWISE)")),
+                FakeResponse(
+                    extract_response("Comet NEOWISE", "C/2020 F3 (NEOWISE) is a comet.")
+                ),
+            ]
+        )
+        result = provider.fetch(apod)
+
+        self.assertEqual(result.status, SupplementalInfo.Status.FOUND)
+        self.assertEqual(result.matched_title, "Comet NEOWISE")
+        self.assertEqual(session.calls[0]["srsearch"], "Comet NEOWISE over Lebanon")
+        self.assertEqual(
+            session.calls[1]["srsearch"], "Comet OR NEOWISE OR over OR Lebanon"
+        )
+
+    def test_a_weak_tier_one_hit_does_not_stop_the_cascade(self):
+        """The old behaviour: any hit at all ended the search."""
+        apod = self.make_apod("Ice Halos over Bavaria", "Ice crystals split sunlight.")
+        provider, session = self.provider(
+            responses=[
+                FakeResponse(search_response(*BAD_MATCH_CANDIDATES["Ice Halos over Bavaria"])),
+                FakeResponse(search_response("Halo (optical phenomenon)")),
+                FakeResponse(
+                    extract_response("Halo (optical phenomenon)", "A halo is an optical phenomenon.")
+                ),
+            ]
+        )
+        result = provider.fetch(apod)
+
+        self.assertEqual(result.status, SupplementalInfo.Status.FOUND)
+        self.assertEqual(result.matched_title, "Halo (optical phenomenon)")
+        self.assertEqual(len(session.calls), 3)

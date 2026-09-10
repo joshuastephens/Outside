@@ -94,6 +94,151 @@ without refactoring, and `/` currently redirects to the Browsable API.
 
 ---
 
+## 3 — SECRET_KEY question
+
+> Why does the .env require a SECRET_KEY? How is that used?
+
+A question, not a change request. Answered by inspection rather than from
+memory: grepping the installed packages for `SECRET_KEY` consumers, and booting
+a container with an empty key to observe the actual failure. The finding was
+that Django's own guard is lazy — `manage.py check` passes with an empty key and
+only the first real request fails — which is the justification for reading it
+from the environment with no fallback. `MessageMiddleware` builds a signed
+cookie storage on every request, so the key is on the hot path even for
+anonymous read-only JSON.
+
+> yes, make that update
+
+The follow-up offered and accepted: `.env.example` and the README's quick start
+had suggested a key-generation command that assumed a local Django install,
+which a Docker-only project does not have. Replaced with
+`python3 -c "import secrets; print(secrets.token_urlsafe(64))"` plus a Docker
+equivalent. `secrets.token_urlsafe` also emits only `[A-Za-z0-9_-]`, avoiding
+the `#` that Django's own `get_random_secret_key()` can produce — which would
+read as a comment inside a `.env` file.
+
+---
+
+## 4 — Wikipedia matching needs work
+
+The reviewer tested the cascade against 16 real APOD titles on the live
+MediaWiki API. Every one returned a match — `not_found` never fired — and five
+were confidently wrong (*Mono Lake* for "Pink Aurora over Crater Lake",
+*Yara Zgheib* for "Comet NEOWISE over Lebanon", and so on). The diagnosis given
+was precise: `srlimit: 1` plus `hits[0]` means there is only ever one candidate
+and no score, so nothing can tell a good match from a bad one.
+
+The instruction, abbreviated:
+
+> Guiding principle: a recorded miss is better than a confident wrong answer.
+> `status: not_found` with a reason is a good outcome. A wrong extract presented
+> as fact is not.
+>
+> Please fix this by scoring candidates rather than trusting the top hit:
+> (1) raise `srlimit` to 5; (2) score each candidate page title on token overlap
+> against the APOD title plus the first ~500 chars of the explanation, with
+> common stopwords removed, normalized by the number of tokens in the candidate
+> title; (3) take the best-scoring candidate above a threshold, otherwise return
+> `not_found` with a reason naming the best candidate and its score; (4) tune the
+> threshold — it must reject all five bad matches while preserving the eight good
+> ones.
+>
+> Keep the `SupplementalProvider` interface unchanged. `fetch()` must still never
+> raise. Keep the existing cascade — widening and scoring should sit on top of
+> it, not replace it. Add unit tests covering a rejected low-scoring match, a
+> correctly chosen non-first candidate, and a preserved existing good match.
+> Update the README's cascade section and revise the "top hit is right"
+> assumption.
+
+### How it was tuned
+
+Scoring was tuned against live data rather than estimates, which mattered: a
+first pass on paper put a bad match (*Mono Lake*, ~0.5) **above** a good one
+(*Fish Head Nebula*, ~0.33), which would have made a single threshold
+impossible. Fetching the real candidate lists changed the picture and surfaced
+three refinements that plain token overlap needs:
+
+- **Explanation matches weighted at 0.5**, below the threshold by construction.
+  Without this, single-word generic pages (*Earth*, *Rainbow*, *White* — all real
+  candidates in the sample) score 1.0 whenever the word appears anywhere in the
+  explanation.
+- **Parenthetical qualifiers stripped**, so *Halo (optical phenomenon)* is scored
+  as the subject it names.
+- **Substring matching for compound words**, because APOD writes "Fishhead" and
+  Wikipedia titles the page *Fish Head Nebula*.
+
+A fourth was added after noticing a latent tie: *Nebula* and *Cat's Eye Nebula*
+both score 1.0 against "The Cat's Eye Nebula from Hubble". Ties now break toward
+the candidate accounting for more of the APOD entry.
+
+Scoring was also placed *inside* each cascade tier rather than after it, so a
+tier that returns only weak candidates no longer ends the search. That single
+change converts three of the five bad matches into correct ones instead of
+misses.
+
+### Result
+
+Verified against live MediaWiki: all five bad matches rejected, all eight good
+ones preserved, with *Comet NEOWISE*, *Halo (optical phenomenon)*, and *Saturn*
+now matched correctly. A further sweep of 20 unrelated real APOD dates through
+the running service gave 17 good or defensible matches, 1 recorded miss, and 1
+lexically perfect but semantically wrong match — both remaining limits are
+documented in the README's Post-Challenge Notes.
+
+---
+
+## 5 — Clean up the test suite's console output
+
+> Running the test suite prints a full Python traceback to the console, from
+> `logger.exception` in `_attach_supplemental`. [...] Nothing is actually wrong
+> [...] But anyone running the tests for the first time sees an alarming
+> traceback and has to go read the test to work out that it is expected. That is
+> a bad first impression on a submission someone else will run.
+>
+> Please make the suite's output clean, without weakening what the test proves.
+> Two requirements: (1) The traceback should not print during a normal test run.
+> Suppress it by capturing it within the test rather than by turning the logging
+> off in settings or removing the `logger.exception` call — that logging is
+> correct production behavior and must stay exactly as it is. (2) While you are
+> there, the test should assert that the failure *was* logged. Right now the code
+> relies on that logging but nothing verifies it, so a future refactor could
+> silently drop it.
+>
+> Check the rest of the suite for tests that emit similar expected-but-alarming
+> output — the provider timeout test just above this one looks like it may do
+> the same thing — and give them the same treatment so the whole run is quiet.
+
+Measuring first showed the traceback was 13 of 72 output lines, with 44 more
+from three other sources: `apod.providers` warnings from the two deliberate
+failure tests, `django.request` logging every 4xx and 5xx the test client
+provokes, and routine `INFO` chatter from the cache and client paths.
+
+The fix has two layers, both capture-based:
+
+- `QuietLogsMixin` in `apod/tests/base.py` swaps the `apod` and `django.request`
+  loggers' handlers for a collecting one while a test runs, then restores them.
+  Records land in `self.log_records` rather than the console. It touches only
+  this process's handlers -- never the project's logging configuration.
+- The four tests that deliberately provoke a logged failure now wrap the call in
+  `assertLogs` and assert what was logged. The provider-raises test additionally
+  asserts the record carries `exc_info` and that the exception is the
+  `RuntimeError` it injected, so the traceback itself is part of the contract.
+
+Verified by mutation rather than by inspection. Three changes to the production
+code, each reverted afterwards:
+
+| Mutation | Result |
+| --- | --- |
+| `logger.exception` → `logger.error` | FAIL — "unexpectedly None : the traceback must be recorded" |
+| Delete the `logger.exception` call | FAIL — "no logs of level ERROR or higher triggered on apod.services" |
+| Delete the provider's `logger.warning` | FAIL — "no logs of level WARNING or higher triggered on apod.providers" |
+
+`services.py` and `providers.py` were confirmed byte-identical to their
+pre-mutation state afterwards, and the running container still emits its normal
+`INFO` lines. Suite output went from 72 lines to 9; 68 tests, still passing.
+
+---
+
 ## What was built, in order
 
 No further prompts were needed. The build proceeded as follows.
@@ -138,6 +283,7 @@ is also how NASA interprets the `date` parameter.
 
 ### Final state
 
-42 tests passing, `docker compose up --build` serving live NASA and Wikipedia
-data on port 8080, and every documented status code verified against the running
-stack.
+68 tests passing, `docker compose up --build` serving live NASA and Wikipedia
+data on port 8080, every documented status code verified against the running
+stack, and Wikipedia match quality verified against the live API on both the
+16-title tuning set and a 20-date sweep.

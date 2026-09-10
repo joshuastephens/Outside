@@ -13,9 +13,14 @@ import logging
 import requests
 from django.conf import settings
 
+from .matching import MATCH_THRESHOLD, best_match
 from .models import SupplementalInfo
 
 logger = logging.getLogger(__name__)
+
+# Wikimedia's User-Agent policy asks that automated clients identify themselves
+# with a contact point; a repository URL satisfies it.
+USER_AGENT = "Outside/1.0 (https://github.com/joshuastephens/Outside)"
 
 
 @dataclasses.dataclass
@@ -78,10 +83,29 @@ class WikipediaProvider(SupplementalProvider):
       3. the terms OR-ed together -- lets relevance ranking find the subject
          inside the prose, which is what rescues the XZ Andromedae case
 
-    The top hit is then fetched for its intro extract. Steps run only when the
-    previous one came up empty, and only on a cache miss, so the common case is
-    still two round trips.
+    Widening the search is only half the problem. MediaWiki returns *something*
+    for nearly any query, so the failure mode that matters is not "no hits" but
+    a plausible wrong hit -- "Pink Aurora over Crater Lake" confidently matching
+    *Mono Lake*. So each tier requests five candidates and scores them against
+    the APOD entry (see `matching.py`); a tier is only accepted if its best
+    candidate clears `MATCH_THRESHOLD`, and otherwise the cascade continues.
+
+    That combination is what rescues "Comet NEOWISE over Lebanon": tier 1
+    returns only the novelist *Yara Zgheib*, which scores 0.0, so the cascade
+    advances and tier 3 finds *Comet NEOWISE* at 1.0.
+
+    When nothing anywhere clears the bar, the result is a recorded `not_found`
+    naming the best candidate and its score. A diagnosable miss is a better
+    outcome than a confident wrong answer.
+
+    The accepted page is then fetched for its intro extract. Tiers run only
+    while the previous one has come up short, and only on a cache miss, so a
+    clean match still costs two round trips.
     """
+
+    # Enough candidates for scoring to have something to choose between,
+    # without paying for a long tail that never wins.
+    search_limit = 5
 
     source = "wikipedia"
 
@@ -109,19 +133,11 @@ class WikipediaProvider(SupplementalProvider):
                 self.source, "APOD has no title to search on."
             )
 
-        search, hits = self._search(title)
-        if not hits:
+        matched_title, search, best = self._select_candidate(apod, title)
+        if matched_title is None:
             return SupplementalResult.not_found(
                 self.source,
-                f"No Wikipedia search results for {title!r}.",
-                raw_response=search,
-            )
-
-        matched_title = hits[0].get("title")
-        if not matched_title:
-            return SupplementalResult.not_found(
-                self.source,
-                "Wikipedia search result had no title.",
+                self._miss_reason(title, best),
                 raw_response=search,
             )
 
@@ -164,24 +180,70 @@ class WikipediaProvider(SupplementalProvider):
             raw_response=detail,
         )
 
-    def _search(self, title):
-        """Run the query cascade, returning (last response, hits)."""
+    def _select_candidate(self, apod, title):
+        """Walk the cascade, scoring each tier's candidates.
+
+        Returns `(accepted title or None, last search response, (best title,
+        best score))`. The best-seen pair is carried across tiers so a miss can
+        say how close it got.
+        """
+        best_title, best_score = None, 0.0
         response = {}
+
         for query in self._candidate_queries(title):
-            response = self._get(
-                {
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "srlimit": 1,
-                    "format": "json",
-                }
+            response = self._search(query)
+            candidates = [
+                hit["title"]
+                for hit in response.get("query", {}).get("search", [])
+                if hit.get("title")
+            ]
+            if not candidates:
+                continue
+
+            candidate, score = best_match(candidates, apod.title, apod.explanation)
+            if score > best_score:
+                best_title, best_score = candidate, score
+
+            if score >= MATCH_THRESHOLD:
+                logger.info(
+                    "Wikipedia matched %r to %r (score %.2f) via query %r",
+                    title,
+                    candidate,
+                    score,
+                    query,
+                )
+                return candidate, response, (candidate, score)
+
+            logger.debug(
+                "Wikipedia tier %r best candidate %r scored %.2f, below %.2f",
+                query,
+                candidate,
+                score,
+                MATCH_THRESHOLD,
             )
-            hits = response.get("query", {}).get("search", [])
-            if hits:
-                logger.info("Wikipedia matched %r via query %r", title, query)
-                return response, hits
-        return response, []
+
+        return None, response, (best_title, best_score)
+
+    def _miss_reason(self, title, best):
+        """Explain a miss in terms a reader can act on."""
+        best_title, best_score = best
+        if best_title is None:
+            return f"No Wikipedia search results for {title!r}."
+        return (
+            f"No Wikipedia result scored above {MATCH_THRESHOLD:.2f} for "
+            f"{title!r}; best candidate was {best_title!r} at {best_score:.2f}."
+        )
+
+    def _search(self, query):
+        return self._get(
+            {
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": self.search_limit,
+                "format": "json",
+            }
+        )
 
     @staticmethod
     def _candidate_queries(title):
@@ -208,7 +270,7 @@ class WikipediaProvider(SupplementalProvider):
             self.api_url,
             params=params,
             timeout=self.timeout,
-            headers={"User-Agent": "Outside/1.0 (APOD coding challenge)"},
+            headers={"User-Agent": USER_AGENT},
         )
         response.raise_for_status()
         return response.json()
